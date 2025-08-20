@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { authenticateUser } from "../auth";
 import { RateLimiterMode } from "../../../src/types";
-import { createRedisConnection, getScrapeQueue } from "../../../src/services/queue-service";
+import { getScrapeQueue } from "../../../src/services/queue-service";
 import { redisEvictConnection } from "../../../src/services/redis";
 import { logger } from "../../../src/lib/logger";
 import { getCrawl, getCrawlJobs } from "../../../src/lib/crawl-redis";
@@ -12,13 +12,11 @@ import { Job } from "bullmq";
 import { toLegacyDocument } from "../v1/types";
 import type { DBJob, PseudoJob } from "../v1/crawl-status";
 import { getJobFromGCS } from "../../lib/gcs-jobs";
-import IORedis from "ioredis";
 configDotenv();
 
-export async function getJobs(crawlId: string, ids: string[], conn: IORedis): Promise<PseudoJob<any>[]> {
-  const queue = getScrapeQueue(conn);
+export async function getJobs(crawlId: string, ids: string[]): Promise<PseudoJob<any>[]> {
    const [bullJobs, dbJobs, gcsJobs] = await Promise.all([
-      Promise.all(ids.map((x) => queue.getJob(x))).then(x => x.filter(x => x)) as Promise<(Job<any, any, string> & { id: string })[]>,
+      Promise.all(ids.map((x) => getScrapeQueue().getJob(x))).then(x => x.filter(x => x)) as Promise<(Job<any, any, string> & { id: string })[]>,
       process.env.USE_DB_AUTHENTICATION === "true" ? await supabaseGetJobsByCrawlId(crawlId) : [],
       process.env.GCS_BUCKET_NAME ? Promise.all(ids.map(async (x) => ({ id: x, job: await getJobFromGCS(x) }))).then(x => x.filter(x => x.job)) as Promise<({ id: string, job: any | null })[]> : [],
     ]);
@@ -57,7 +55,7 @@ export async function getJobs(crawlId: string, ids: string[], conn: IORedis): Pr
   
       const job: PseudoJob<any> = {
         id,
-        getState: bullJob ? (() => bullJob.getState()) : (() => dbJob!.success ? "completed" : "failed"),
+        getState: dbJob ? (() => dbJob.success ? "completed" : "failed") : (() => bullJob!.getState()),
         returnvalue: Array.isArray(data)
           ? data[0]
           : data,
@@ -89,6 +87,9 @@ export async function crawlStatusController(req: Request, res: Response) {
 
     redisEvictConnection.sadd("teams_using_v0", team_id)
       .catch(error => logger.error("Failed to add team to teams_using_v0", { error, team_id }));
+    
+    redisEvictConnection.sadd("teams_using_v0:" + team_id, "crawl:" + req.params.jobId + ":status")
+      .catch(error => logger.error("Failed to add team to teams_using_v0 (2)", { error, team_id }));
 
     const sc = await getCrawl(req.params.jobId);
     if (!sc) {
@@ -99,10 +100,8 @@ export async function crawlStatusController(req: Request, res: Response) {
       return res.status(403).json({ error: "Forbidden" });
     }
     let jobIDs = await getCrawlJobs(req.params.jobId);
-    const conn = createRedisConnection();
-    let jobs = await getJobs(req.params.jobId, jobIDs, conn);
+    let jobs = await getJobs(req.params.jobId, jobIDs);
     let jobStatuses = await Promise.all(jobs.map((x) => x.getState()));
-    conn.disconnect();
 
     // Combine jobs and jobStatuses into a single array of objects
     let jobsWithStatuses = jobs.map((job, index) => ({

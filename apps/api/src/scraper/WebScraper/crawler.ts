@@ -10,9 +10,9 @@ import { logger as _logger } from "../../lib/logger";
 import https from "https";
 import { redisEvictConnection } from "../../services/redis";
 import { extractLinks } from "../../lib/html-transformer";
-import { TimeoutSignal } from "../../controllers/v1/types";
 import { filterLinks } from "../../lib/crawler";
 import { fetchRobotsTxt, createRobotsChecker, isUrlAllowedByRobots } from "../../lib/robots-txt";
+import { ScrapeJobTimeoutError } from "../../lib/error";
 
 export interface FilterResult {
   allowed: boolean;
@@ -353,6 +353,7 @@ export class WebCrawler {
     };
 
     const _urlsHandler = async (urls: string[]) => {
+      this.logger.debug("urlsHandler invoked");
       if (fromMap && onlySitemap) {
         return await urlsHandler(urls);
       } else {
@@ -754,7 +755,7 @@ export class WebCrawler {
         mock,
       );
     } catch (error) {
-      if (error instanceof TimeoutSignal) {
+      if (error instanceof ScrapeJobTimeoutError) {
         throw error;
       } else {
         this.logger.debug(`Failed to fetch sitemap from ${sitemapUrl}`, {
@@ -804,7 +805,7 @@ export class WebCrawler {
             mock,
           );
         } catch (error) {
-          if (error instanceof TimeoutSignal) {
+          if (error instanceof ScrapeJobTimeoutError) {
             throw error;
           } else {
             this.logger.debug(
@@ -815,7 +816,7 @@ export class WebCrawler {
         }
       }
     } catch (error) {
-      if (error instanceof TimeoutSignal) {
+      if (error instanceof ScrapeJobTimeoutError) {
         throw error;
       } else {
         this.logger.debug(`Error processing main domain sitemap`, {
@@ -839,7 +840,7 @@ export class WebCrawler {
           mock,
         );
       } catch (error) {
-        if (error instanceof TimeoutSignal) {
+        if (error instanceof ScrapeJobTimeoutError) {
           throw error;
         } else {
           this.logger.debug(`Failed to fetch sitemap from ${baseUrlSitemap}`, {

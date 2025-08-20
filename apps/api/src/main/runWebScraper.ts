@@ -10,7 +10,6 @@ import { supabase_service } from "../services/supabase";
 import { logger as _logger } from "../lib/logger";
 import { configDotenv } from "dotenv";
 import {
-  EngineResultsTracker,
   scrapeURL,
   ScrapeUrlResponse,
 } from "../scraper/scrapeURL";
@@ -20,11 +19,9 @@ configDotenv();
 
 export async function startWebScraperPipeline({
   job,
-  token,
   costTracking,
 }: {
   job: Job<WebScraperOptions> & { id: string };
-  token: string;
   costTracking: CostTracking;
 }) {
   return await runWebScraper({
@@ -34,19 +31,15 @@ export async function startWebScraperPipeline({
       ...job.data.scrapeOptions,
       ...(job.data.crawl_id
         ? {
-            formats: job.data.scrapeOptions.formats.concat(["rawHtml"]),
+            formats: job.data.scrapeOptions.formats.concat([{ type: "rawHtml" }]),
           }
         : {}),
     },
-    internalOptions: job.data.internalOptions,
-    // onSuccess: (result, mode) => {
-    //   logger.debug(`🐂 Job completed ${job.id}`);
-    //   saveJob(job, result, token, mode);
-    // },
-    // onError: (error) => {
-    //   logger.error(`🐂 Job failed ${job.id}`);
-    //   ScrapeEvents.logJobEvent(job, "failed");
-    // },
+    internalOptions: {
+      crawlId: job.data.crawl_id,
+      teamId: job.data.team_id,
+      ...job.data.internalOptions,
+    },
     team_id: job.data.team_id,
     bull_job_id: job.id.toString(),
     priority: job.opts.priority,
@@ -62,8 +55,6 @@ export async function runWebScraper({
   mode,
   scrapeOptions,
   internalOptions,
-  // onSuccess,
-  // onError,
   team_id,
   bull_job_id,
   priority,
@@ -84,7 +75,6 @@ export async function runWebScraper({
   logger.info("runWebScraper called");
 
   let response: ScrapeUrlResponse | undefined = undefined;
-  let engines: EngineResultsTracker = {};
   let error: any = undefined;
 
   for (let i = 0; i < tries; i++) {
@@ -98,7 +88,6 @@ export async function runWebScraper({
     }
 
     response = undefined;
-    engines = {};
     error = undefined;
 
     try {
@@ -124,11 +113,6 @@ export async function runWebScraper({
         }
       }
 
-      // This is where the returnvalue from the job is set
-      // onSuccess(response.document, mode);
-
-      engines = response.engines;
-
       if (
         (response.document.metadata.statusCode >= 200 &&
           response.document.metadata.statusCode < 300) ||
@@ -139,12 +123,6 @@ export async function runWebScraper({
       }
     } catch (_error) {
       error = _error;
-      engines =
-        response !== undefined
-          ? response.engines
-          : typeof error === "object" && error !== null
-            ? ((error as any).results ?? {})
-            : {};
     }
   }
 
@@ -191,8 +169,6 @@ export async function runWebScraper({
       return {
         success: false,
         error,
-        logs: ["no logs -- error coming from runWebScraper"],
-        engines,
       };
     }
   }
@@ -201,9 +177,7 @@ export async function runWebScraper({
 const saveJob = async (
   job: Job,
   result: any,
-  token: string,
   mode: string,
-  engines?: EngineResultsTracker,
 ) => {
   try {
     const useDbAuthentication = process.env.USE_DB_AUTHENTICATION === "true";

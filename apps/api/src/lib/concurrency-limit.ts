@@ -3,7 +3,7 @@ import { redisEvictConnection } from "../services/redis";
 import type { Job, JobsOptions } from "bullmq";
 import { getACUCTeam } from "../controllers/auth";
 import { getCrawl, StoredCrawl } from "./crawl-redis";
-import { createRedisConnection, getScrapeQueue } from "../services/queue-service";
+import { getScrapeQueue } from "../services/queue-service";
 import { logger } from "./logger";
 
 const constructKey = (team_id: string) => "concurrency-limiter:" + team_id;
@@ -75,11 +75,9 @@ export async function pushConcurrencyLimitedJob(
   timeout: number,
   now: number = Date.now(),
 ) {
-  await redisEvictConnection.zadd(
-    constructQueueKey(team_id),
-    now + timeout,
-    JSON.stringify(job),
-  );
+  const queueKey = constructQueueKey(team_id);
+  await redisEvictConnection.zadd(queueKey, now + timeout, JSON.stringify(job));
+  await redisEvictConnection.sadd("concurrency-limit-queues", queueKey);
 }
 
 export async function getConcurrencyLimitedJobs(
@@ -218,8 +216,26 @@ async function getNextConcurrentJob(teamId: string, i = 0): Promise<{
           zeroDataRetention: finalJob.job.data?.zeroDataRetention,
           i
         });
+      } else if (i > 100) {
+        logger.error("Failed to remove job from concurrency limit queue, hard bailing", {
+          teamId,
+          jobId: finalJob.job.id,
+          zeroDataRetention: finalJob.job.data?.zeroDataRetention,
+          i
+        });
+        return null;
       }
-      return await getNextConcurrentJob(teamId, i + 1);
+
+      return await new Promise((resolve, reject) => setTimeout(() => {
+        getNextConcurrentJob(teamId, i + 1).then(resolve).catch(reject);
+      }, Math.floor(Math.random() * 300))); // Stagger the workers off to break up the clump that causes the race condition
+    } else {
+      logger.debug("Removed job from concurrency limit queue", {
+        teamId,
+        jobId: finalJob.job.id,
+        zeroDataRetention: finalJob.job.data?.zeroDataRetention,
+        i
+      });
     }
   }
 
@@ -258,8 +274,7 @@ export async function concurrentJobDone(job: Job) {
           }
         }
 
-        const conn = createRedisConnection();
-        getScrapeQueue(conn).add(
+        (await getScrapeQueue()).add(
           nextJob.job.id,
           {
             ...nextJob.job.data,
@@ -271,7 +286,6 @@ export async function concurrentJobDone(job: Job) {
             priority: nextJob.job.priority,
           }
         );
-        conn.disconnect();
       }
     }
   }

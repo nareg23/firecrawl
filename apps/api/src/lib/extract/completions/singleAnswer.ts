@@ -19,6 +19,7 @@ export async function singleAnswerCompletion({
   extractId,
   sessionId,
   costTracking,
+  metadata,
 }: {
   singleAnswerDocs: Document[];
   rSchema: any;
@@ -29,6 +30,7 @@ export async function singleAnswerCompletion({
   extractId: string;
   sessionId: string;
   costTracking: CostTracking;
+  metadata: { teamId: string, functionId?: string, extractId?: string, scrapeId?: string };
 }): Promise<{
   extract: any;
   tokenUsage: TokenUsage;
@@ -42,7 +44,6 @@ export async function singleAnswerCompletion({
       extractId,
     }),
     options: {
-      mode: "llm",
       systemPrompt:
         (systemPrompt ? `${systemPrompt}\n` : "") +
         "Always prioritize using the provided content to answer the question. Do not make up an answer. Do not hallucinate. In case you can't find the information and the string is required, instead of 'N/A' or 'Not speficied', return an empty string: '', if it's not a string and you can't find the information, return null. Be concise and follow the schema always if provided.",
@@ -60,6 +61,10 @@ export async function singleAnswerCompletion({
         method: "singleAnswerCompletion",
       },
     },
+    metadata: {
+      ...metadata,
+      functionId: metadata.functionId ? (metadata.functionId + "/singleAnswerCompletion") : "singleAnswerCompletion",
+    },
   };
     
   const { extractedDataArray, warning } = await extractData({
@@ -68,6 +73,10 @@ export async function singleAnswerCompletion({
     useAgent,
     extractId,
     sessionId,
+    metadata: {
+      ...metadata,
+      functionId: metadata.functionId ? (metadata.functionId + "/singleAnswerCompletion") : "singleAnswerCompletion",
+    },
   });
 
   const completion = {

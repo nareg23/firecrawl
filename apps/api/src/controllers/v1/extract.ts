@@ -14,6 +14,7 @@ import { performExtraction_F0 } from "../../lib/extract/fire-0/extraction-servic
 import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { logger as _logger } from "../../lib/logger";
+import { fromV1ScrapeOptions } from "../v2/types";
 
 export async function oldExtract(
   req: RequestWithAuth<{}, ExtractResponse, ExtractRequest>,
@@ -89,8 +90,15 @@ export async function extractController(
     zeroDataRetention: req.acuc?.flags?.forceZDR,
   });
 
+  const scrapeOptions = req.body.scrapeOptions
+    ? fromV1ScrapeOptions(req.body.scrapeOptions, req.body.scrapeOptions.timeout, req.auth.team_id).scrapeOptions
+    : undefined;
+
   const jobData = {
-    request: req.body,
+    request: {
+      ...req.body,
+      scrapeOptions,
+    },
     teamId: req.auth.team_id,
     subId: req.acuc?.sub_id,
     extractId,
@@ -119,34 +127,9 @@ export async function extractController(
     zeroDataRetention: req.acuc?.flags?.forceZDR,
   });
 
-  if (Sentry.isInitialized()) {
-    const size = JSON.stringify(jobData).length;
-    await Sentry.startSpan(
-      {
-        name: "Add extract job",
-        op: "queue.publish",
-        attributes: {
-          "messaging.message.id": extractId,
-          "messaging.destination.name": getExtractQueue().name,
-          "messaging.message.body.size": size,
-        },
-      },
-      async (span) => {
-        await getExtractQueue().add(extractId, {
-          ...jobData,
-          sentry: {
-            trace: Sentry.spanToTraceHeader(span),
-            baggage: Sentry.spanToBaggageHeader(span),
-            size,
-          },
-        }, { jobId: extractId });
-      },
-    );
-  } else {
-    await getExtractQueue().add(extractId, jobData, {
-      jobId: extractId,
-    });
-  }
+  await getExtractQueue().add(extractId, jobData, {
+    jobId: extractId,
+  });
 
   return res.status(200).json({
     success: true,

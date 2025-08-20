@@ -6,6 +6,7 @@ import crypto from "crypto";
 import { redisEvictConnection } from "./redis";
 import type { Logger } from "winston";
 import psl from "psl";
+import { MapDocument } from "../controllers/v2/types";
 configDotenv();
 
 // SupabaseService class initializes the Supabase client conditionally based on environment variables.
@@ -97,6 +98,7 @@ export async function saveIndexToGCS(id: string, doc: {
   error?: string;
   screenshot?: string;
   numPages?: number;
+  contentType?: string;
 }): Promise<void> {
   try {
       if (!process.env.GCS_INDEX_BUCKET_NAME) {
@@ -333,6 +335,173 @@ export async function getOMCEQueueLength(): Promise<number> {
   return await redisEvictConnection.scard(OMCE_JOB_QUEUE_KEY) ?? 0;
 }
 
+// Domain Frequency Tracking
+const DOMAIN_FREQUENCY_QUEUE_KEY = "domain-frequency-queue";
+const DOMAIN_FREQUENCY_BATCH_SIZE = 100;
+
+export function extractDomainFromUrl(url: string): string | null {
+  try {
+    const urlObj = new URL(url);
+    // Remove www. prefix for consistency
+    let domain = urlObj.hostname;
+    if (domain.startsWith("www.")) {
+      domain = domain.slice(4);
+    }
+    return domain;
+  } catch (error) {
+    _logger.warn("Failed to extract domain from URL", { url, error });
+    return null;
+  }
+}
+
+export async function addDomainFrequencyJob(url: string) {
+  const domain = extractDomainFromUrl(url);
+  if (!domain) {
+    return;
+  }
+  
+  await redisEvictConnection.rpush(DOMAIN_FREQUENCY_QUEUE_KEY, domain);
+}
+
+export async function getDomainFrequencyJobs(): Promise<Map<string, number>> {
+  const domains = (await redisEvictConnection.lpop(DOMAIN_FREQUENCY_QUEUE_KEY, DOMAIN_FREQUENCY_BATCH_SIZE)) ?? [];
+  
+  // Aggregate domain counts in memory before batch insert
+  const domainCounts = new Map<string, number>();
+  for (const domain of domains) {
+    domainCounts.set(domain, (domainCounts.get(domain) || 0) + 1);
+  }
+  
+  return domainCounts;
+}
+
+export async function processDomainFrequencyJobs() {
+  if (!useIndex) {
+    return;
+  }
+  
+  const domainCounts = await getDomainFrequencyJobs();
+  if (domainCounts.size === 0) {
+    return;
+  }
+  
+  _logger.info(`Domain frequency processor found domains to update`, { domainCount: domainCounts.size });
+  
+  try {
+    // Convert to array format for the stored procedure
+    const updates = Array.from(domainCounts.entries()).map(([domain, count]) => ({
+      domain,
+      count
+    }));
+    
+    // Use the upsert function for efficient batch update
+    const { error } = await index_supabase_service.rpc('upsert_domain_frequencies', {
+      domain_updates: updates
+    });
+    
+    if (error) {
+      _logger.error(`Domain frequency processor failed to update domains`, { error, domainCount: domainCounts.size });
+      // Re-queue the domains on failure
+      for (const [domain, count] of domainCounts) {
+        for (let i = 0; i < count; i++) {
+          await redisEvictConnection.rpush(DOMAIN_FREQUENCY_QUEUE_KEY, domain);
+        }
+      }
+    } else {
+      _logger.info(`Domain frequency processor updated domains`, { domainCount: domainCounts.size });
+    }
+  } catch (error) {
+    _logger.error(`Domain frequency processor failed to update domains`, { error, domainCount: domainCounts.size });
+    // Re-queue the domains on failure
+    for (const [domain, count] of domainCounts) {
+      for (let i = 0; i < count; i++) {
+        await redisEvictConnection.rpush(DOMAIN_FREQUENCY_QUEUE_KEY, domain);
+      }
+    }
+  }
+}
+
+export async function getDomainFrequencyQueueLength(): Promise<number> {
+  return await redisEvictConnection.llen(DOMAIN_FREQUENCY_QUEUE_KEY) ?? 0;
+}
+
+// Domain frequency query utilities
+export async function getTopDomains(limit: number = 100): Promise<Array<{ domain: string, frequency: number, last_updated: string }>> {
+  if (!useIndex) {
+    return [];
+  }
+  
+  const { data, error } = await index_supabase_service
+    .from("domain_frequency")
+    .select("domain, frequency, last_updated")
+    .order("frequency", { ascending: false })
+    .limit(limit);
+  
+  if (error) {
+    _logger.error("Failed to get top domains", { error });
+    return [];
+  }
+  
+  return data ?? [];
+}
+
+export async function getDomainFrequency(domain: string): Promise<number | null> {
+  if (!useIndex) {
+    return null;
+  }
+  
+  const { data, error } = await index_supabase_service
+    .from("domain_frequency")
+    .select("frequency")
+    .eq("domain", domain)
+    .single();
+  
+  if (error) {
+    if (error.code !== "PGRST116") { // Not found error
+      _logger.error("Failed to get domain frequency", { error, domain });
+    }
+    return null;
+  }
+  
+  return data?.frequency ?? null;
+}
+
+export async function getDomainFrequencyStats(): Promise<{
+  totalDomains: number;
+  totalRequests: number;
+  avgRequestsPerDomain: number;
+} | null> {
+  if (!useIndex) {
+    return null;
+  }
+  
+  const { data, error } = await index_supabase_service
+    .from("domain_frequency")
+    .select("frequency");
+  
+  if (error) {
+    _logger.error("Failed to get domain frequency stats", { error });
+    return null;
+  }
+  
+  if (!data || data.length === 0) {
+    return {
+      totalDomains: 0,
+      totalRequests: 0,
+      avgRequestsPerDomain: 0
+    };
+  }
+  
+  const totalRequests = data.reduce((sum, row) => sum + row.frequency, 0);
+  const totalDomains = data.length;
+  
+  return {
+    totalDomains,
+    totalRequests,
+    avgRequestsPerDomain: Math.round(totalRequests / totalDomains)
+  };
+}
+
 export async function queryIndexAtSplitLevel(url: string, limit: number, maxAge = 2 * 24 * 60 * 60 * 1000): Promise<string[]> {
   if (!useIndex || process.env.FIRECRAWL_INDEX_WRITE_ONLY === "true") {
     return [];
@@ -455,4 +624,110 @@ export async function queryOMCESignatures(hostname: string, maxAge = 2 * 24 * 60
   }
 
   return data?.[0]?.signatures ?? [];
+}
+
+export async function queryIndexAtSplitLevelWithMeta(url: string, limit: number): Promise<MapDocument[]> {
+  if (!useIndex || process.env.FIRECRAWL_INDEX_WRITE_ONLY === "true") {
+    return [];
+  }
+
+  const urlObj = new URL(url);
+  urlObj.search = "";
+
+  const urlSplitsHash = generateURLSplits(urlObj.href).map(x => hashURL(x));
+
+  const level = urlSplitsHash.length - 1;
+
+  let links: MapDocument[] = [];
+  let iteration = 0;
+
+  while (true) {
+    // Query the index for the next set of links
+    const { data: _data, error } = await index_supabase_service
+      .rpc("query_index_at_split_level_with_meta", {
+        i_level: level,
+        i_url_hash: urlSplitsHash[level],
+        i_newer_than: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+      })
+      .range(iteration * 1000, (iteration + 1) * 1000)
+
+    // If there's an error, return the links we have
+    if (error) {
+      _logger.warn("Error querying index", { error, url, limit });
+      return links.slice(0, limit);
+    }
+
+    // Add the links to the set
+    const data = _data ?? [];
+    data.forEach((x) => links.push({
+      url: x.resolved_url,
+      title: x.title ?? undefined,
+      description: x.description ?? undefined,
+    }));
+
+    // If we have enough links, return them
+    if (links.length >= limit) {
+      return links.slice(0, limit);
+    }
+
+    // If we get less than 1000 links from the query, we're done
+    if (data.length < 1000) {
+      return links.slice(0, limit);
+    }
+
+    iteration++;
+  }
+}
+
+export async function queryIndexAtDomainSplitLevelWithMeta(hostname: string, limit: number): Promise<MapDocument[]> {
+  if (!useIndex || process.env.FIRECRAWL_INDEX_WRITE_ONLY === "true") {
+    return [];
+  }
+
+  const domainSplitsHash = generateDomainSplits(hostname).map(x => hashURL(x));
+
+  const level = domainSplitsHash.length - 1;
+  if (domainSplitsHash.length === 0) {
+    return [];
+  }
+
+  let links: MapDocument[] = [];
+  let iteration = 0;
+
+  while (true) {
+    // Query the index for the next set of links
+    const { data: _data, error } = await index_supabase_service
+      .rpc("query_index_at_domain_split_level_with_meta", {
+        i_level: level,
+        i_domain_hash: domainSplitsHash[level],
+        i_newer_than: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+      })
+      .range(iteration * 1000, (iteration + 1) * 1000)
+
+    // If there's an error, return the links we have
+    if (error) {
+      _logger.warn("Error querying index", { error, hostname, limit });
+      return links.slice(0, limit);
+    }
+
+    // Add the links to the set
+    const data = _data ?? [];
+    data.forEach((x) => links.push({
+      url: x.resolved_url,
+      title: x.title ?? undefined,
+      description: x.description ?? undefined,
+    }));
+
+    // If we have enough links, return them
+    if (links.length >= limit) {
+      return links.slice(0, limit);
+    }
+
+    // If we get less than 1000 links from the query, we're done
+    if (data.length < 1000) {
+      return links.slice(0, limit);
+    }
+
+    iteration++;
+  }
 }

@@ -6,13 +6,14 @@ import {
   cleanBefore24hCompleteJobsController,
   queuesController,
 } from "../controllers/v0/admin/queue";
-import { wrap } from "./v1";
+import { wrap } from "./shared";
 import { acucCacheClearController } from "../controllers/v0/admin/acuc-cache-clear";
 import { checkFireEngine } from "../controllers/v0/admin/check-fire-engine";
 import { cclogController } from "../controllers/v0/admin/cclog";
 import { indexQueuePrometheus } from "../controllers/v0/admin/index-queue-prometheus";
 import { zdrcleanerController } from "../controllers/v0/admin/zdrcleaner";
 import { triggerPrecrawl } from "../controllers/v0/admin/precrawl";
+import { metricsController } from "../controllers/v0/admin/metrics";
 
 export const adminRouter = express.Router();
 
@@ -67,4 +68,9 @@ adminRouter.get(
 adminRouter.get(
   `/admin/${process.env.BULL_AUTH_KEY}/precrawl`,
   wrap(triggerPrecrawl),
+);
+
+adminRouter.get(
+  `/admin/${process.env.BULL_AUTH_KEY}/metrics`,
+  wrap(metricsController),
 );

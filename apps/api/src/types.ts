@@ -3,10 +3,10 @@ import {
   AuthCreditUsageChunk,
   BaseScrapeOptions,
   ScrapeOptions,
-  Document as V1Document,
+  Document as V2Document,
   webhookSchema,
   TeamFlags,
-} from "./controllers/v1/types";
+} from "./controllers/v2/types";
 import { ExtractorOptions, Document } from "./lib/entities";
 import { InternalOptions } from "./scraper/scrapeURL";
 import type { CostTracking } from "./lib/extract/extraction-service";
@@ -67,8 +67,6 @@ export interface RunWebScraperParams {
   mode: Mode;
   scrapeOptions: ScrapeOptions;
   internalOptions?: InternalOptions;
-  // onSuccess: (result: V1Document, mode: string) => void;
-  // onError: (error: Error) => void;
   team_id: string;
   bull_job_id: string;
   priority?: number;
@@ -85,7 +83,7 @@ export type RunWebScraperResult =
     }
   | {
       success: true;
-      document: V1Document;
+      document: V2Document;
     };
 
 export interface FirecrawlJob {

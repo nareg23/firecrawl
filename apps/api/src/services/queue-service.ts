@@ -1,10 +1,12 @@
-import { Queue } from "bullmq";
+import { Queue, QueueEvents } from "bullmq";
 import { logger } from "../lib/logger";
 import IORedis from "ioredis";
+import { BullMQOtel } from "bullmq-otel";
 
 export type QueueFunction = () => Queue<any, any, string, any, any, string>;
 
 let scrapeQueue: Queue;
+let scrapeQueueEvents: QueueEvents;
 let extractQueue: Queue;
 let loggingQueue: Queue;
 let indexQueue: Queue;
@@ -12,14 +14,20 @@ let deepResearchQueue: Queue;
 let generateLlmsTxtQueue: Queue;
 let billingQueue: Queue;
 let precrawlQueue: Queue;
+let redisConnection: IORedis;
 
-export function createRedisConnection(): IORedis {
-  return new IORedis(process.env.REDIS_URL!, {
-    maxRetriesPerRequest: null,
-  });
+export function getRedisConnection(): IORedis {
+  if (!redisConnection) {
+    redisConnection = new IORedis(process.env.REDIS_URL!, {
+      maxRetriesPerRequest: null,
+    });
+    redisConnection.on("connect", () => logger.info("Redis connected"));
+    redisConnection.on("reconnecting", () => logger.warn("Redis reconnecting"));
+    redisConnection.on("error", (err) => logger.warn("Redis error", { err }));
+
+  }
+  return redisConnection;
 }
-
-export const redisConnection = createRedisConnection();
 
 export const scrapeQueueName = "{scrapeQueue}";
 export const extractQueueName = "{extractQueue}";
@@ -30,24 +38,38 @@ export const deepResearchQueueName = "{deepResearchQueue}";
 export const billingQueueName = "{billingQueue}";
 export const precrawlQueueName = "{precrawlQueue}";
 
-export function getScrapeQueue(redisConnection: IORedis) {
-  return new Queue(scrapeQueueName, {
-    connection: redisConnection,
-    defaultJobOptions: {
-      removeOnComplete: {
-        age: 3600, // 1 hour
+export function getScrapeQueue() {
+  if (!scrapeQueue) {
+    scrapeQueue = new Queue(scrapeQueueName, {
+      connection: getRedisConnection(),
+      defaultJobOptions: {
+        removeOnComplete: {
+          age: 3600, // 1 hour
+        },
+        removeOnFail: {
+          age: 3600, // 1 hour
+        },
       },
-      removeOnFail: {
-        age: 3600, // 1 hour
-      },
-    },
-  });
+      telemetry: new BullMQOtel("firecrawl-bullmq"),
+    });
+  }
+  return scrapeQueue;
+}
+
+export function getScrapeQueueEvents() {
+  if (!scrapeQueueEvents) {
+    scrapeQueueEvents = new QueueEvents(scrapeQueueName, {
+      connection: getRedisConnection(),
+    });
+  }
+
+  return scrapeQueueEvents;
 }
 
 export function getExtractQueue() {
   if (!extractQueue) {
     extractQueue = new Queue(extractQueueName, {
-      connection: redisConnection,
+      connection: getRedisConnection(),
       defaultJobOptions: {
         removeOnComplete: {
           age: 90000, // 25 hours
@@ -56,8 +78,8 @@ export function getExtractQueue() {
           age: 90000, // 25 hours
         },
       },
+      telemetry: new BullMQOtel("firecrawl-bullmq"),
     });
-    logger.info("Extraction queue created");
   }
   return extractQueue;
 }
@@ -65,7 +87,7 @@ export function getExtractQueue() {
 export function getGenerateLlmsTxtQueue() {
   if (!generateLlmsTxtQueue) {
     generateLlmsTxtQueue = new Queue(generateLlmsTxtQueueName, {
-      connection: redisConnection,
+      connection: getRedisConnection(),
       defaultJobOptions: {
         removeOnComplete: {
           age: 90000, // 25 hours
@@ -74,8 +96,8 @@ export function getGenerateLlmsTxtQueue() {
           age: 90000, // 25 hours
         },
       },
+      telemetry: new BullMQOtel("firecrawl-bullmq"),
     });
-    logger.info("LLMs TXT generation queue created");
   }
   return generateLlmsTxtQueue;
 }
@@ -83,7 +105,7 @@ export function getGenerateLlmsTxtQueue() {
 export function getDeepResearchQueue() {
   if (!deepResearchQueue) {
     deepResearchQueue = new Queue(deepResearchQueueName, {
-      connection: redisConnection,
+      connection: getRedisConnection(),
       defaultJobOptions: {
         removeOnComplete: {
           age: 90000, // 25 hours
@@ -92,8 +114,8 @@ export function getDeepResearchQueue() {
           age: 90000, // 25 hours
         },
       },
+      telemetry: new BullMQOtel("firecrawl-bullmq"),
     });
-    logger.info("Deep research queue created");
   }
   return deepResearchQueue;
 }
@@ -101,7 +123,7 @@ export function getDeepResearchQueue() {
 export function getBillingQueue() {
   if (!billingQueue) {
     billingQueue = new Queue(billingQueueName, {
-      connection: redisConnection,
+      connection: getRedisConnection(),
       defaultJobOptions: {
         removeOnComplete: {
           age: 60, // 1 minute
@@ -110,8 +132,8 @@ export function getBillingQueue() {
           age: 3600, // 1 hour
         },
       },
+      telemetry: new BullMQOtel("firecrawl-bullmq"),
     });
-    logger.info("Billing queue created");
   }
   return billingQueue;
 }
@@ -119,7 +141,7 @@ export function getBillingQueue() {
 export function getPrecrawlQueue() {
   if (!precrawlQueue) {
     precrawlQueue = new Queue(precrawlQueueName, {
-      connection: redisConnection,
+      connection: getRedisConnection(),
       defaultJobOptions: {
         removeOnComplete: {
           age: 24 * 60 * 60, // 1 day
@@ -128,8 +150,8 @@ export function getPrecrawlQueue() {
           age: 24 * 60 * 60, // 1 day
         },
       },
+      telemetry: new BullMQOtel("firecrawl-bullmq"),
     });
-    logger.info("Precrawl queue created");
   }
   return precrawlQueue;
 }

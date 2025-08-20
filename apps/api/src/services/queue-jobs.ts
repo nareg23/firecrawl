@@ -1,4 +1,4 @@
-import { createRedisConnection, getScrapeQueue, scrapeQueueName } from "./queue-service";
+import { getScrapeQueue, getScrapeQueueEvents } from "./queue-service";
 import { v4 as uuidv4 } from "uuid";
 import { NotificationType, RateLimiterMode, WebScraperOptions } from "../types";
 import * as Sentry from "@sentry/node";
@@ -19,6 +19,10 @@ import { getJobFromGCS, removeJobFromGCS } from "../lib/gcs-jobs";
 import { Document } from "../controllers/v1/types";
 import { getCrawl } from "../lib/crawl-redis";
 import { Logger } from "winston";
+import { Job } from "bullmq";
+import { ScrapeJobTimeoutError, TransportableError } from "../lib/error";
+import { deserializeTransportableError } from "../lib/error-serde";
+import { robustFetch } from '../scraper/scrapeURL/lib/fetch';
 
 /**
  * Checks if a job is a crawl or batch scrape based on its options
@@ -54,7 +58,50 @@ export async function _addScrapeJobToBullMQ(
   options: any,
   jobId: string,
   jobPriority: number,
-) {
+): Promise<Job> {
+  // Global A/B test: mirror request to staging /v1/scrape based on SCRAPEURL_AB_RATE
+  const abLogger = _logger.child({ method: "ABTestToStaging" });
+  try {
+    const abRateEnv = process.env.SCRAPEURL_AB_RATE;
+    const abHostEnv = process.env.SCRAPEURL_AB_HOST;
+    const abRate = abRateEnv !== undefined ? Math.max(0, Math.min(1, Number(abRateEnv))) : 0;
+    const shouldABTest = webScraperOptions.mode === "single_urls"
+      && !webScraperOptions.zeroDataRetention
+      && !webScraperOptions.internalOptions?.zeroDataRetention
+      && abRate > 0
+      && Math.random() <= abRate
+      && abHostEnv
+      && webScraperOptions.internalOptions?.v1Agent === undefined
+      && webScraperOptions.internalOptions?.v1JSONAgent === undefined;
+    if (shouldABTest) {
+      (async () => {
+        try {
+          abLogger.info("A/B-testing scrapeURL to staging");
+          const abort = AbortSignal.timeout(Math.min(60000, (webScraperOptions.scrapeOptions.timeout ?? 30000) + 10000));
+          await robustFetch({
+            url: `http://${abHostEnv}/v2/scrape`,
+            method: "POST",
+            body: {
+              url: webScraperOptions.url,
+              ...webScraperOptions.scrapeOptions,
+              origin: (webScraperOptions.scrapeOptions as any).origin ?? "api",
+            },
+            logger: abLogger,
+            tryCount: 1,
+            ignoreResponse: true,
+            mock: null,
+            abort,
+          });
+          abLogger.info("A/B-testing scrapeURL (staging) request sent");
+        } catch (error) {
+          abLogger.warn("A/B-testing scrapeURL (staging) failed", { error });
+        }
+      })();
+    }
+  } catch (error) {
+    abLogger.warn("Failed to initiate A/B test to staging", { error });
+  }
+
   if (
     webScraperOptions &&
     webScraperOptions.team_id
@@ -69,13 +116,11 @@ export async function _addScrapeJobToBullMQ(
     }
   }
 
-  const conn = createRedisConnection();
-  await getScrapeQueue(conn).add(jobId, webScraperOptions, {
+  return await getScrapeQueue().add(jobId, webScraperOptions, {
     ...options,
     priority: jobPriority,
     jobId,
   });
-  conn.disconnect();
 }
 
 async function addScrapeJobRaw(
@@ -84,7 +129,7 @@ async function addScrapeJobRaw(
   jobId: string,
   jobPriority: number,
   directToBullMQ: boolean = false,
-) {
+): Promise<Job | null> {
   let concurrencyLimited: "yes" | "yes-crawl" | "no" | null = null;
   let currentActiveConcurrency = 0;
   let maxConcurrency = 0;
@@ -145,8 +190,9 @@ async function addScrapeJobRaw(
       jobId,
       jobPriority,
     );
+    return null;
   } else {
-    await _addScrapeJobToBullMQ(webScraperOptions, options, jobId, jobPriority);
+    return await _addScrapeJobToBullMQ(webScraperOptions, options, jobId, jobPriority);
   }
 }
 
@@ -156,39 +202,8 @@ export async function addScrapeJob(
   jobId: string = uuidv4(),
   jobPriority: number = 10,
   directToBullMQ: boolean = false,
-) {
-  if (Sentry.isInitialized()) {
-    const size = JSON.stringify(webScraperOptions).length;
-    return await Sentry.startSpan(
-      {
-        name: "Add scrape job",
-        op: "queue.publish",
-        attributes: {
-          "messaging.message.id": jobId,
-          "messaging.destination.name": scrapeQueueName,
-          "messaging.message.body.size": size,
-        },
-      },
-      async (span) => {
-        await addScrapeJobRaw(
-          {
-            ...webScraperOptions,
-            sentry: {
-              trace: Sentry.spanToTraceHeader(span),
-              baggage: Sentry.spanToBaggageHeader(span),
-              size,
-            },
-          },
-          options,
-          jobId,
-          jobPriority,
-          directToBullMQ,
-        );
-      },
-    );
-  } else {
-    await addScrapeJobRaw(webScraperOptions, options, jobId, jobPriority, directToBullMQ);
-  }
+): Promise<Job | null> {
+  return await addScrapeJobRaw(webScraperOptions, options, jobId, jobPriority, directToBullMQ);
 }
 
 export async function addScrapeJobs(
@@ -322,33 +337,11 @@ export async function addScrapeJobs(
     await Promise.all(
       addToCQ.map(async (job) => {
         const size = JSON.stringify(job.data).length;
-        return await Sentry.startSpan(
-          {
-            name: "Add scrape job",
-            op: "queue.publish",
-            attributes: {
-              "messaging.message.id": job.opts.jobId,
-              "messaging.destination.name": scrapeQueueName,
-              "messaging.message.body.size": size,
-            },
-          },
-          async (span) => {
-            const jobData = {
-              ...job.data,
-              sentry: {
-                trace: Sentry.spanToTraceHeader(span),
-                baggage: Sentry.spanToBaggageHeader(span),
-                size,
-              },
-            };
-  
-            await _addScrapeJobToConcurrencyQueue(
-              jobData,
-              job.opts,
-              job.opts.jobId,
-              job.opts.priority,
-            );
-          },
+        await _addScrapeJobToConcurrencyQueue(
+          job.data,
+          job.opts,
+          job.opts.jobId,
+          job.opts.priority,
         );
       }),
     );
@@ -356,88 +349,71 @@ export async function addScrapeJobs(
     await Promise.all(
       addToBull.map(async (job) => {
         const size = JSON.stringify(job.data).length;
-        return await Sentry.startSpan(
-          {
-            name: "Add scrape job",
-            op: "queue.publish",
-            attributes: {
-              "messaging.message.id": job.opts.jobId,
-              "messaging.destination.name": scrapeQueueName,
-              "messaging.message.body.size": size,
-            },
-          },
-          async (span) => {
-            await _addScrapeJobToBullMQ(
-              {
-                ...job.data,
-                sentry: {
-                  trace: Sentry.spanToTraceHeader(span),
-                  baggage: Sentry.spanToBaggageHeader(span),
-                  size,
-                },
-              },
-              job.opts,
-              job.opts.jobId,
-              job.opts.priority,
-            );
-          },
+        await _addScrapeJobToBullMQ(
+          job.data,
+          job.opts,
+          job.opts.jobId,
+          job.opts.priority,
         );
       }),
     );
   }
 }
 
-export function waitForJob(
-  jobId: string,
-  timeout: number,
+export async function waitForJob(
+  _job: Job | string,
+  timeout: number | null,
   logger: Logger = _logger,
 ): Promise<Document> {
-  return new Promise(async (resolve, reject) => {
     const start = Date.now();
-    const conn = createRedisConnection();
-    const queue = getScrapeQueue(conn);
-    while (true) {
-      logger.debug("WaitforJob ran", { scrapeId: jobId, jobId });
-      if (Date.now() >= start + timeout) {
-        reject(new Error("Job wait "));
-        break;
-      } else {
-        const state = await queue.getJobState(jobId);
-        logger.debug("Job in state", { state, scrapeId: jobId, jobId });
-        if (state === "completed") {
-          let doc: Document;
-          const job = (await queue.getJob(jobId))!;
-          logger.debug("Got job");
-          doc = job.returnvalue;
-
-          if (!doc) {
-            const docs = await getJobFromGCS(jobId);
-            logger.debug("Got job from GCS");
-            if (!docs || docs.length === 0) {
-              throw new Error("Job not found in GCS");
-            }
-            doc = docs[0];
-
-            if (job.data?.internalOptions?.zeroDataRetention) {
-              await removeJobFromGCS(jobId);
-            }
-          }
-
-          resolve(doc);
-          break;
-        } else if (state === "failed") {
-          const job = await queue.getJob(jobId);
-          if (job && job.failedReason !== "Concurrency limit hit") {
-            reject(job.failedReason);
-            break;
-          }
-        }
+    const queue = getScrapeQueue();
+    let job: Job | undefined = typeof _job == "string" ? await queue.getJob(_job) : _job;
+    while (job === undefined) {
+      logger.debug("Waiting for job to be created");
+      await new Promise(resolve => setTimeout(resolve, 500));
+      job = await queue.getJob(_job as string);
+      if (Date.now() - start > (timeout ?? 180000)) {
+        throw new ScrapeJobTimeoutError("Scrape timed out while waiting in the concurrency limit queue");
       }
+    }
+    let doc: Document;
+    try {
+      doc = await Promise.race([
+        job.waitUntilFinished(getScrapeQueueEvents(), timeout ?? 180000),
+        timeout !== null ? new Promise((resolve, reject) => {
+          setTimeout(() => {
+            reject(new ScrapeJobTimeoutError("Scrape timed out" + (typeof _job === "string" ? " after waiting in the concurrency limit queue" : "")));
+          }, Math.max(0, timeout - (Date.now() - start)));
+        }) : null,
+      ].filter(x => x !== null));
+    } catch (e) {
+      if (e instanceof TransportableError) {
+        throw e;
+      } else if (e instanceof Error) {
+        const x = deserializeTransportableError(e.message);
+        if (x) {
+          throw x;
+        } else {
+          throw e;
+        }
+      } else {
+        throw e;
+      }
+    }
+    logger.debug("Got job");
+    
+    if (!doc) {
+      const docs = await getJobFromGCS(job.id!);
+      logger.debug("Got job from GCS");
+      if (!docs || docs.length === 0) {
+        throw new Error("Job not found in GCS");
+      }
+      doc = docs[0];
 
-      await new Promise((resolve) => setTimeout(resolve, 750));
+      if (job.data?.internalOptions?.zeroDataRetention) {
+        await removeJobFromGCS(job.id!);
+      }
     }
 
-    conn.disconnect();
-    return;
-  });
+    return doc;
 }

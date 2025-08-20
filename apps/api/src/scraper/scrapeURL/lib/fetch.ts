@@ -2,11 +2,11 @@ import { Logger } from "winston";
 import { z, ZodError } from "zod";
 import * as Sentry from "@sentry/node";
 import { MockState, saveMock } from "./mock";
-import { TimeoutSignal } from "../../../controllers/v1/types";
 import { fireEngineURL } from "../engines/fire-engine/scrape";
-import { fetch, RequestInit, Response, FormData, Agent } from "undici";
+import { fetch, Response, FormData, Agent } from "undici";
 import { cacheableLookup } from "./cacheableLookup";
-import { log } from "console";
+import dns from "dns";
+import { AbortManagerThrownError } from "./abortManager";
 
 export type RobustFetchParams<Schema extends z.Schema<any>> = {
   url: string;
@@ -23,7 +23,24 @@ export type RobustFetchParams<Schema extends z.Schema<any>> = {
   tryCooldown?: number;
   mock: MockState | null;
   abort?: AbortSignal;
+  useCacheableLookup?: boolean;
 };
+
+const robustAgent = new Agent({
+  headersTimeout: 0,
+  bodyTimeout: 0,
+  connect: {
+    lookup: cacheableLookup.lookup,
+  },
+});
+
+const robustAgentNoLookup = new Agent({
+  headersTimeout: 0,
+  bodyTimeout: 0,
+  connect: {
+    lookup: dns.lookup,
+  },
+});
 
 export async function robustFetch<
   Schema extends z.Schema<any>,
@@ -42,6 +59,7 @@ export async function robustFetch<
   tryCooldown,
   mock,
   abort,
+  useCacheableLookup = true,
 }: RobustFetchParams<Schema>): Promise<Output> {
   abort?.throwIfAborted();
   
@@ -94,13 +112,7 @@ export async function robustFetch<
           ...(headers !== undefined ? headers : {}),
         },
         signal: abort,
-        dispatcher: new Agent({
-          headersTimeout: 0,
-          bodyTimeout: 0,
-          connect: {
-            lookup: cacheableLookup.lookup,
-          },
-        }),
+        dispatcher: useCacheableLookup ? robustAgent : robustAgentNoLookup,
         ...(body instanceof FormData
           ? {
               body,
@@ -112,8 +124,8 @@ export async function robustFetch<
             : {}),
       });
     } catch (error) {
-      if (error instanceof TimeoutSignal || (error instanceof Error && error.name === "TimeoutError")) {
-        throw new TimeoutSignal();
+      if (error instanceof AbortManagerThrownError) {
+        throw error;
       } else if (!ignoreFailure) {
         Sentry.captureException(error);
         if (tryCount > 1) {
